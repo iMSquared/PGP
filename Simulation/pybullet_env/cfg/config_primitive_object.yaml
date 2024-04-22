@@ -1,0 +1,178 @@
+project_params:
+  use_nvidia: False
+  custom_urdf_path: "urdf"
+  robot: "ur5_suction"
+
+  debug:
+    show_gui: False
+    get_data: False            # NOTE(ssh): This will be deprecated. Use the below one instead.
+
+
+  overridable:
+    collect_data: False        # Flag only for data collection, not debugging.
+    sftp        : False
+    default_exp_log_dir_path      : "./exp_fetching"    
+    default_exp_learning_dir_path : "/home/sanghyeon/workspace/POMDP/Simulation/pybullet_env/learning/exp"
+    default_dataset_save_path     : "/home/sanghyeon/asdf"                 # sim_dataset, exec_dataset dir will be created under here.
+    default_dataset_save_path_sftp: ""
+
+    use_guided_policy: False
+    use_guided_value : False
+    guide_q_value   : False
+    guide_preference: False
+
+    inference_device: "cuda:0"
+
+
+
+sim_params:
+  control_hz: 240.0 
+  delay: 0.00
+  gravity: -9.
+
+  debug_camera:
+    distance: 1.0
+    yaw: 290
+    pitch: -48
+    target_position: [0.4, -0.05, 0.15]
+
+manipulation_params:
+  inverse_kinematics:
+    max_num_iterations: 1000
+    residual_threshold: 1.0E-8  
+  rrt_trials: 1 # Use utils.RRT_ITERATIONS instead.
+
+pose_sampler_params:
+  num_filter_trials: 10
+  grasp_affordance_threshold: 0.67
+  pos_offset: 0.8
+  default_z: 0.42
+  default_orn: [0.0, -1.57, 0.0]
+
+
+env_params:
+  binpick_env:
+
+    cabinet:
+      path: "cabinet/cabinet.urdf"
+      pos: [0.55, 0.0, 0.0]
+      orn: [0.0, 0.0, 0.0]
+      
+    objects:
+    - pos: [0.60, 0.00, 0.6501]
+      orn: [0.0, 0.0, 0.0]
+      is_target: True
+      urdf_file_path: "cuboid/cuboid_target.urdf"
+      pcd_file_path: "cuboid/cuboid_point_cloud.pickle"
+    - pos: [0.50, 0.1, 0.6501]
+      orn: [0.0, 0.0, 0.0]
+      is_target: False
+      urdf_file_path: "cuboid/cuboid_non_target.urdf"
+      pcd_file_path: "cuboid/cuboid_point_cloud.pickle"
+    - pos: [0.50, -0.1, 0.6501]
+      orn: [0.0, 0.0, 0.0]
+      is_target: False
+      urdf_file_path: "cuboid/cuboid_non_target.urdf"
+      pcd_file_path: "cuboid/cuboid_point_cloud.pickle"
+
+
+
+    taskspace:
+      center     : [0.55,  0.0,  0.6501]
+      half_ranges: [0.15, 0.25, 0.0]
+    
+    random_init:
+      target:
+        pos_center     : [0.6, 0.0, 0.6501]
+        pos_half_ranges: [0.1, 0.15, 0.0]
+        orn_center     : [0.0, 0.0, 0.0]
+        orn_half_ranges: [0.0, 0.0, 1.57]
+      nontarget:
+        pos_center     : [0.5, 0.0, 0.6501]
+        pos_half_ranges: [0.05, 0.1, 0.0]
+        orn_center     : [0.0, 0.0, 0.0]
+        orn_half_ranges: [0.0, 0.0, 1.57]
+
+    goal:
+      color: [0.5804, 0.0, 0.8275]
+      pos: [0.15, -0.2, 0.18]
+
+    dynamics:
+      lateral_friction: 1.6
+      rolling_friction: 0.0004
+      spinning_friction: 0.0004
+      restitution: 0.2
+
+    depth_camera:
+      target_pos: [1.0, 0.0, 0.67]
+      distance: 0.8
+      roll: 0.0
+      pitch: 0.0
+      yaw: -90.0
+
+      fov: 87.0
+      width: 64
+      height: 64
+      near_val: 0.01
+      far_val: 0.7
+      voxel_down_sample_size: 0.01
+      
+      noise_std: 0.0001
+      
+
+robot_params:
+
+  ur5_suction:
+    path: "ur5/urdf/ur5_suction.urdf"
+    pos: [0.0, 0.0, 0.52]
+    orn: [0.0, 0.0, 0.0]
+    joint_index_last: 6
+    joint_indices_arm: [1, 2, 3, 4, 5, 6]   # Without base fixed joint (UR5 specific)
+    link_index_endeffector_base: 6          # 6 is more stable than 7 when solving IK... for some unknown reason       
+    rest_pose: [
+      0.0,        # Base (Fixed)  
+      0.0,        # Joint 0
+      -2.094,     # Joint 1
+      2.07,       # Joint 2
+      -1.57,      # Joint 3
+      -1.57,      # Joint 4
+      0.0,        # Joint 5         (Try to reset to 0 after release)
+      0.0,        # Joint 6 EE Base (Fixed)
+    ]
+
+    gripper:
+      link_indices_endeffector_tip: [11, 12, 13, 14]
+      base_to_tip_stroke: 0.12      # 12 cm from wrist3 link frame (link 6)
+      grasp_poke_backward: 0.02     # Start poking from 2cm backward 
+      grasp_poke_criteria: 0.003    # 3mm poke?
+
+
+
+plan_params:
+  num_sims: 100
+  max_depth: 8    # 3 objects -> 8, 4 objects -> 10
+  planning_time: -1
+  discount_factor: 1.0
+  exploration_const: 
+    preference: 5.0
+    value: 100
+  k_a: 2.5        # 3 objects -> 2.5 (5 childs), 4 objects -> 3.0 (6 childs)
+  alpha_a: 0.15
+  k_o: 2.5        # Same as k_a?
+  alpha_o: 0.15
+  select_best_action: True
+
+  # Reward setting is dependent to [project_params][overridable][guide_preference]
+  reward:
+    value:
+      success: 100.        # Depth 8: +25
+      fail: -100.
+      infeasible: -100.
+      timestep_pick: -1. # Depth 8: -15
+      timestep_place: -1.
+    preference:
+      success: 0.
+      fail: 0.
+      infeasible: 0.
+      timestep_pick: 0.
+      timestep_place: 0.

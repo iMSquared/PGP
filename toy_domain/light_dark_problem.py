@@ -1,0 +1,1106 @@
+import os
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+from POMDP_framework import *
+from POMCP import *
+from POMCPOW import *
+import util
+
+import random
+import numpy as np
+import sys
+import matplotlib.pyplot as plt
+from matplotlib.collections import PolyCollection
+from matplotlib import animation
+
+import time
+import pickle
+
+from policy import SettingPolicy, NNRegressionPolicyModel
+from value import SettingValue, GuideValueNet
+from value_q import SettingQValue, GuideQValueNet
+
+
+class State(State):
+    """The state of the problem is just the robot position"""
+    def __init__(self, position):
+        """
+        Initializes a state in light dark domain.
+
+        Args:
+            position (tuple): position of the robot.
+        """
+        if len(position) != 2:
+            raise ValueError("State position must be a vector of length 2")
+        self.position = position
+
+    def __hash__(self):
+        return hash(tuple(self.position))
+    
+    def __eq__(self, other):
+        if isinstance(other, State):
+            return self.position == other.position
+        else:
+            return False
+        
+    def __str__(self):
+        return self.__repr__()
+    
+    def __repr__(self):
+        return "State(%s)" % (str(self.position))
+
+
+class Action(Action):
+    """The action is a vector of velocities(2-dimension)"""
+    def __init__(self, control):
+        """
+        Initializes a state in light dark domain.
+
+        Args:
+            control (tuple): velocity
+        """
+        if len(control) != 2:
+            raise ValueError("Action control must be a vector of length 2")        
+        self.control = control
+
+    def __hash__(self):
+        return hash(self.control)
+    
+    def __eq__(self, other):
+        if isinstance(other, Action):
+            return self.control == other.control
+        else:
+            return False
+        
+    def __str__(self):
+        return self.__repr__()
+    
+    def __repr__(self):
+        return "Action(%s)" % (str(self.control))
+
+
+class Observation(Observation):
+    """Defines the Observation for the continuous light-dark domain;
+
+    Observation space: 
+
+        :math:`\Omega\subseteq\mathbb{R}^2` the observation of the robot is
+            an estimate of the robot position :math:`g(x_t)\in\Omega`.
+
+    """
+    # # the number of decimals to round up an observation when it is discrete.
+    # PRECISION=2
+    
+    def __init__(self, position, discrete=False):
+        """
+        Initializes a observation in light dark domain.
+
+        Args:
+            position (tuple): position of the robot.
+        """
+        self._discrete = discrete
+        if len(position) != 2:
+            raise ValueError("Observation position must be a vector of length 2")
+        if self._discrete:
+            self.position = position
+        else:
+            # self.position = (round(position[0], Observation.PRECISION),
+            #                  round(position[1], Observation.PRECISION))
+            self.position = (position[0], position[1])
+
+    def discretize(self):
+        return Observation(self.position, discrete=True)
+
+    def __hash__(self):
+        return hash(self.position)
+    
+    def __eq__(self, other):
+        if isinstance(other, Observation):
+            return self.position == other.position
+        else:
+            return False
+        
+    def __str__(self):
+        return self.__repr__()
+    
+    def __repr__(self):
+        return "Observation(%s)" % (str(self.position))
+
+
+class TransitionModel(TransitionModel):
+    """
+    The underlying deterministic system dynamics
+    """
+    def __init__(self, epsilon=1e-9):
+        self._epsilon = epsilon
+
+    def probability(self, next_state, state, action, **kwargs):
+        """
+        Deterministic.
+        """
+        expected_position = tuple(self.func(state.position, action))
+        if next_state.position == expected_position:
+            return 1.0 - self._epsilon
+        else:
+            return self._epsilon
+
+    def sample(self, state, action):
+        next_state = copy.deepcopy(state)
+        next_state.position = tuple(self.func(state.position, action))
+        return next_state
+
+    def argmax(self, state, action):
+        """Returns the most likely next state"""
+        return self.sample(state, action)
+
+    def func(self, state_pos, action):
+        """Returns the function of the underlying system dynamics.
+        The function is: (xt, ut) -> xt+1 where xt, ut, xt+1 are
+        all numpy arrays."""
+        return np.array([state_pos[0] + action[0],
+                        state_pos[1] + action[1]])
+    
+    def func_noise(self, var_sysd=1e-9):
+        """Returns a function that returns a state-dependent Gaussian noise."""
+        def fn(mt):
+            gaussian_noise = Gaussian([0,0],
+                                      [[var_sysd, 0],
+                                      [0, var_sysd]])
+            return gaussian_noise
+        return fn
+
+
+class ObservationModel(ObservationModel):
+
+    def __init__(self, light, const):
+        """
+        `light` and `const` are parameters in
+        :math:`w(x) = \frac{1}{2}(\text{light}-s_x)^2 + \text{const}`
+
+        They should both be floats. The quantity :math:`w(x)` will
+        be used as the variance of the covariance matrix in the gaussian
+        distribution (this is how I understood the paper).
+        """
+        self._light = light
+        self._const = const
+
+    def _compute_variance(self, pos):
+        return 0.01 * (abs(self._light - pos[0]))**4 + self._const
+
+    def noise_covariance(self, pos):
+        variance = self._compute_variance(pos)
+        return np.array([[variance, 0],
+                         [0, variance]])
+
+    # |FIXME| observe according to true/belief state??
+    def probability(self, observation, next_true_state, next_belief, action):
+        """
+        The observation is :math:`g(x_t) = x_t+\omega`. So
+        the probability of this observation is the probability
+        of :math:`\omega` which follows the Gaussian distribution.
+        """
+        # if self._discrete:
+        #     observation = observation.discretize()
+        variance = self._compute_variance(next_true_state.position)
+        gaussian_noise = Gaussian([0,0],
+                                  [[variance, 0],
+                                   [0, variance]])
+        omega = (observation.position[0] - next_belief.position[0],
+                 observation.position[1] - next_belief.position[1])
+        return gaussian_noise[omega]
+
+    def sample(self, next_state, action, argmax=False):
+        """sample an observation."""
+        # Sample a position shift according to the gaussian noise.
+        obs_pos = self.func(next_state.position, False)
+        return Observation(tuple(obs_pos))
+        
+    def argmax(self, next_state, action):
+        return self.sample(next_state, action, argmax=True)
+
+    def func(self, next_state_pos, mpe=False):
+        variance = self._compute_variance(next_state_pos)
+        gaussian_noise = Gaussian([0,0],
+                                  [[variance, 0],
+                                   [0, variance]])
+        if mpe:
+            omega = gaussian_noise.mpe()
+        else:
+            omega = gaussian_noise.random()
+        return np.array([next_state_pos[0] + omega[0],
+                         next_state_pos[1] + omega[1]])
+
+    def func_noise(self):
+        """Returns a function that returns a state-dependent Gaussian noise."""
+        def fn(mt):
+            variance = self._compute_variance(mt)
+            gaussian_noise = Gaussian([0,0],
+                                      [[variance, 0],
+                                       [0, variance]])
+            return gaussian_noise
+        return fn
+
+
+class RewardModel(RewardModel):
+    def __init__(self, light, goal_state, epsilon, valuenet=None):
+        self.light = light
+        self._goal_state = goal_state
+        self._epsilon=epsilon
+        self.valuenet = valuenet
+
+    def _reward_func_state(self, state: State, action, next_state: State, goal_state: State, epsilon):
+        if np.sum((np.asarray(goal_state.position) - np.asarray(next_state.position))**2) < epsilon**2:
+            reward = 100
+        else:
+            # reward = (-1) * np.abs(next_state.position[0] - self.light)
+            reward = -1
+        return reward
+
+        # # Euclidean distance
+        # reward = (-1)*np.sum((np.asarray(goal_state.position) - np.asarray(next_state.position))**2)
+        # return reward
+
+    def _reward_func_particle(self, state: Particles, action: Action, next_state: Particles, goal_state: State, epsilon: float):
+        # for belief state - be used to real action
+        reward_expectatation = 0
+        for state_in in next_state.particles:
+            reward_expectatation += self._reward_func_state(state_in, action, state_in, self._goal_state, self._epsilon)
+        return reward_expectatation / len(next_state)
+
+    def _reward_func_hist(self, state: Histogram, action: Action, next_state: Histogram, goal_state: State, epsilon: float):
+        # for belief state - be used to real action
+        normalized_hist = next_state.get_normalized()
+        reward_expectatation = 0
+        for state_in in normalized_hist:
+            reward_expectatation += normalized_hist[state_in] * self._reward_func_state(state_in, action, state_in, self._goal_state, self._epsilon)
+        return reward_expectatation
+
+    def sample(self, state, action, next_state):
+        # |TODO| make exception
+        # deterministic      
+        if str(type(next_state)) == "<class '__main__.State'>":
+            return self._reward_func_state(state, action, next_state, self._goal_state, self._epsilon)
+        # |TODO| currently, get reward after update, can make same as state case(before update)?
+        elif str(type(next_state)) == "<class 'POMDP_framework.Particles'>":
+            return self._reward_func_particle(state, action, next_state, self._goal_state, self._epsilon)
+        elif str(type(next_state)) == "<class 'POMDP_framework.Histogram'>":
+            return self._reward_func_hist(state, action, next_state, self._goal_state, self._epsilon)
+        
+    # For State
+    def is_goal_state(self, state: State):
+        if np.sum((np.asarray(self._goal_state.position) - np.asarray(state.position))**2) < self._epsilon**2:
+            return True
+        return False
+
+    # For Histogram
+    def is_goal_hist(self, state: Histogram, thres=0.7):
+        # test goal condition: #particle(prob) in goal_state >= thres -> True
+        prob_in_goal = 0
+        normalized_hist = state.get_normalized()
+        for particle in normalized_hist:
+            if np.sum((np.asarray(self._goal_state.position) - np.asarray(particle.position))**2) < self._epsilon**2:
+                prob_in_goal += normalized_hist[particle]
+        print(r"% of particles in goal: " + str(prob_in_goal*100) + "%")
+        return prob_in_goal >= thres
+    
+    # For Particles
+    def is_goal_particles(self, state: Particles, thres=0.7):
+        # test goal condition: #particle(prob) in goal_state >= thres -> True
+        num_particles = len(state)
+        prob_in_goal = 0
+        for particle in state.particles:
+            if np.sum((np.asarray(self._goal_state.position) - np.asarray(particle.position))**2) < self._epsilon**2:
+                prob_in_goal += 1
+        prob_in_goal /= num_particles
+        print(r"% of particles in goal: " + str(prob_in_goal*100) + "%")
+        return prob_in_goal >= thres
+
+
+# class PolicyModel(RandomRollout):
+#     def _NextAction(self, state, x_range=(-1,6), y_range=(-1,6)):
+#         pos = state.position
+#         _action_x = random.uniform(x_range[0] - pos[0], x_range[1] - pos[0])
+#         _action_y = random.uniform(y_range[0] - pos[1], y_range[1] - pos[1])
+#         _action = (_action_x,_action_y)
+#         return _action
+
+
+class PolicyModel(RandomRollout):
+    def _NextAction(self, history, r_range=(0,2), theta_range=(-math.pi, math.pi)):
+        if len(history) == 1:
+            # r = random.uniform(r_range[0], r_range[1])
+            r = random.uniform(r_range[1]/2, r_range[1])
+            theta = random.uniform(theta_range[0]/3, theta_range[1]/3)
+        else:
+            r = random.uniform(r_range[0], r_range[1])
+            theta = random.uniform(theta_range[0], theta_range[1])
+        # r = random.uniform(r_range[0], r_range[1])
+        # theta = random.uniform(theta_range[0], theta_range[1])
+        _action_x = r * math.cos(theta)
+        _action_y = r * math.sin(theta)
+        _action = (_action_x,_action_y)
+        return _action
+
+
+class LightDarkEnvironment(Environment):
+    
+    def __init__(self,
+                 init_state,
+                 light,
+                 const,
+                 reward_model=None):
+        """
+        Args:
+            init_state (light_dark.domain.State or np.ndarray):
+                initial true state of the light-dark domain,
+            goal_pos (tuple): goal position (x,y)
+            light (float):  see below
+            const (float): see below
+            reward_model (pomdp_py.RewardModel): A reward model used to evaluate a policy
+        `light` and `const` are parameters in
+        :math:`w(x) = \frac{1}{2}(\text{light}-s_x)^2 + \text{const}`
+
+        Basically, there is "light" at the x location at `light`,
+        and the farther you are from it, the darker it is.
+        """
+        self._light = light
+        self._const = const
+        self.init_state = init_state
+        transition_model = TransitionModel()
+        if type(init_state) == np.ndarray:
+            init_state = State(init_state)
+        super().__init__(init_state,
+                         transition_model,
+                         reward_model)
+
+    @property
+    def light(self):
+        return self._light
+
+    @property
+    def const(self):
+        return self._const
+
+
+class LightDarkProblem(POMDP):
+    def __init__(self, init_state, init_belief, goal_state, light, const, epsilon, policynet=None, valuenet=None):
+        if policynet is not None:
+            # if valuenet is not None:
+            agent = Agent(init_belief,
+                        policynet,
+                        TransitionModel(),
+                        ObservationModel(light,const),
+                        RewardModel(light, goal_state, epsilon, valuenet))
+        else:
+            agent = Agent(init_belief,
+                        PolicyModel(),
+                        TransitionModel(),
+                        ObservationModel(light,const),
+                        RewardModel(light, goal_state, epsilon, valuenet))
+
+        env = LightDarkEnvironment(init_state,                  # init state
+                                   light,                       # light
+                                   const,                       # const
+                                   RewardModel(light, goal_state, epsilon, valuenet))     # reward model
+        
+        self.goal_state = goal_state
+        
+        super().__init__(agent, env, name="LightDarkProblem")
+
+
+def expectation_belief(belief: Particles):
+    # # For Histogram
+    # total_weight = 0
+    # weighted_sum = [0,0]
+    # for state in hist:
+    #     total_weight += hist[state]
+    #     pos = state.position
+    #     weighted_sum[0] += hist[state]*pos[0]
+    #     weighted_sum[1] += hist[state]*pos[1]
+    # weighted_sum[0] /= total_weight
+    # weighted_sum[1] /= total_weight
+    
+    # For Particles
+    num_particles = len(belief)
+    expectation = [0, 0]
+    for p in belief.particles:
+        pos = p.position
+        expectation[0] += pos[0]
+        expectation[1] += pos[1]
+    expectation[0] /= num_particles
+    expectation[1] /= num_particles
+    
+    return expectation
+
+
+class LightDarkViz:
+    """This class deals with visualizing a light dark domain"""
+
+    def __init__(self, problem: LightDarkProblem, x_range, y_range, res):
+        """
+        Args:
+            env (LightDarkEnvironment): Environment for light dark domain.
+            x_range (tuple): a tuple of floats (x_min, x_max).
+            y_range (tuple): a tuple of floats (y_min, y_max).
+            res (float): specifies the size of each rectangular strip to draw;
+                As in the paper, the light is at a location on the x axis.
+        """
+        self._env = problem.env
+        self._res = res
+        self._x_range = x_range
+        self._y_range = y_range
+        fig = plt.gcf()
+        self._ax = fig.add_subplot(1,1,1)
+        self._goal_pos = problem.goal_state.position
+        self._init_pos = problem.env.init_state.position
+        # self._m_0 = None  # initial belief pose
+        self._init_belief = []
+        for p in problem.agent._init_belief.particles:
+            self._init_belief.append(p.position)
+        self._init_belief = np.asarray(self._init_belief).T
+
+        # For tracking the path; list of robot position tuples
+        self._log_paths = {}
+        self._log_state = []
+        self._log_belief = []
+        self._log_belief_expectation = []
+
+    def log_position(self, position, path=0):
+        if path not in self._log_paths:
+            self._log_paths[path] = []
+        self._log_paths[path].append(position)
+    
+    def log_state(self, state):
+        log = state.position
+        log = np.asarray(log).T
+        self._log_state.append(log)
+
+    def log_belief_expectation(self, belief_expectation):
+        log = np.asarray(belief_expectation).T
+        self._log_belief_expectation.append(log)
+
+    def log_belief(self, belief):
+        log = []
+        for p in belief.particles:
+            log.append(p.position)
+        log = np.asarray(log).T
+        self._log_belief.append(log)
+
+    def set_goal(self, goal_pos):
+        self._goal_pos = goal_pos
+
+    def set_init_state(self, init_pos):
+        self._init_pos = init_pos
+
+    # def set_initial_belief_pos(self, m_0):
+    #     self._m_0 = m_0
+
+    # |FIXME| change Particles to array
+    def set_init_belief(self, init_belief):
+        self._init_belief = init_belief
+
+    def plot(self,
+             path_colors={0: [(0,0,0), (0,0,0)]},
+             path_styles={0: "-"},
+             path_widths={0: 1}):
+        self._plot_gradient()
+        self._plot_path(path_colors, path_styles, path_widths)
+        # self._plot_robot()
+        self._plot_goal()
+        # self._plot_initial_belief_pos()
+        self._plot_initial_belief()
+        self._plot_log_belief()
+        self._plot_state()
+        self._plot_init_state()
+        # self._plot_log_belief_expectation()
+
+    def _plot_robot(self):
+        cur_pos = self._env.state.position
+        util.plot_circle(self._ax, cur_pos,
+                         0.25, # tentative
+                         color="black", fill=False,
+                         linewidth=1, edgecolor="black",
+                         zorder=3)
+
+    # def _plot_initial_belief_pos(self):
+    #     if self._m_0 is not None:
+    #         util.plot_circle(self._ax, self._m_0,
+    #                          0.25, # tentative
+    #                          color="black", fill=False,
+    #                          linewidth=1, edgecolor="black",
+    #                          zorder=3)
+
+    def _plot_goal(self):
+        if self._goal_pos is not None:
+            util.plot_circle(self._ax,
+                             self._goal_pos,
+                             0.25,  # tentative
+                             linewidth=3, edgecolor="red",
+                             zorder=3)
+    
+    def _plot_init_state(self):
+        plt.scatter(self._init_pos[0], self._init_pos[1], c = 'r')
+    
+    def _plot_state(self):
+        s = np.asarray(self._log_state).T
+        # plt.scatter(s[0], s[1], c='k')
+        # plt.plot(s[0], s[1], c='k')
+        for i in range(s.shape[1]-1):
+            plt.arrow(s[0][i], s[1][i], 0.9*(s[0][i+1] - s[0][i]), 0.9*(s[1][i+1] - s[1][i]), color='darkorange', overhang=1, head_width=0.1)
+
+    def _plot_initial_belief(self):
+        if self._init_belief is not None:
+            plt.scatter(self._init_belief[0], self._init_belief[1], s=0.1 ,c='g')
+    
+    def _plot_log_belief(self):
+        for b in self._log_belief:
+            plt.scatter(b[0], b[1], s=0.1 ,c='g')
+
+    def _plot_log_belief_expectation(self):
+        p = np.asarray(self._log_belief_expectation).T
+        plt.scatter(p[0], p[1], c='r')
+        plt.plot(p[0], p[1], c='r')
+
+        # for p in self._log_belief_expectation:
+        #     plt.scatter(p[0], p[1], c='r')
+        #     plt.plot(p[0], p[1], c='r')
+    
+    # def _animate(self, frame):
+    #     plt.scatter(frame[0], frame[1], c='r')
+    #     plt.plot(frame[0], frame[1], c='r')
+    #     return plt
+
+    def _plot_path(self, colors, styles, linewidths):
+        """Plot robot path"""
+        # Plot line segments
+        for path in self._log_paths:
+            if path not in colors:
+                path_color = [(0,0,0)] * len(self._log_paths[path])
+            else:
+                if len(colors[path]) == 2:
+                    c1, c2 = colors[path]
+                    path_color = util.linear_color_gradient(c1, c2,
+                                                            len(self._log_paths[path]),
+                                                            normalize=True)
+                else:
+                    path_color = [colors[path]] * len(self._log_paths[path])
+
+            if path not in styles:
+                path_style = "--"
+            else:
+                path_style = styles[path]
+
+            if path not in linewidths:
+                path_width = 1
+            else:
+                path_width = linewidths[path]
+
+            for i in range(1, len(self._log_paths[path])):
+                p1 = self._log_paths[path][i-1]
+                p2 = self._log_paths[path][i]
+                try:
+                    util.plot_line(self._ax, p1, p2, color=path_color[i],
+                                   linestyle=path_style, zorder=2, linewidth=path_width)
+                except Exception:
+                    import pdb; pdb.set_trace()
+
+    def _plot_gradient(self):
+        """display the light dark domain."""
+        xmin, xmax = self._x_range
+        ymin, ymax = self._y_range
+        # Note that higher brightness has lower brightness value
+        hi_brightness = self._env.const
+        lo_brightness = max(0.01 * (self._env.light - xmin)**4 + self._env.const,
+                            0.01 * (self._env.light - xmax)**4 + self._env.const)
+        # Plot a bunch of rectangular strips along the x axis
+        # Check out: https://stackoverflow.com/questions/10550477
+        x = xmin
+        verts = []
+        colors = []
+        while x < xmax:
+            x_next = x + self._res
+            verts.append([(x, ymin), (x_next, ymin), (x_next, ymax), (x, ymax)])
+            # compute brightness based on equation in the paper
+            # brightness = 0.01 * (self._env.light - x)**4 + self._env.const
+            # map brightness to a grayscale color
+            # grayscale = int(round(util.remap(brightness, hi_brightness, lo_brightness, 255, 0)))
+            grayscale = int(round(255 * 2**(-24) * (x + 4)**4 * (x - 12)**4))
+            grayscale_hex = util.rgb_to_hex((grayscale, grayscale, grayscale))
+            colors.append(grayscale_hex)
+            x = x_next
+        util.plot_polygons(verts, colors, ax=self._ax)
+        self._ax.set_xlim(xmin, xmax)
+        self._ax.set_ylim(ymin, ymax)
+
+
+def main():
+    plotting = None
+    save_log = False
+    save_data = False
+    save_sim_data = False
+    # save_sim_data = 'sim_4.11_8'
+    # name_dataset = 'exec_4.6_10'
+    # name_dataset = None
+    exp = False
+
+    randomize = True
+
+    guide_policy = True
+    guide_value = 'Q'
+    guide_value_const = [0.0, 1.0] # [rollout, network]
+    # guide_value_const = [1.0, 0.0] # [rollout, network]
+    rollout_guide = False
+    only_guide = False
+
+    # Environment Setting
+    # define the observation noise equation.
+    light = 4.0
+    const = 0.001
+    # define the radius of goal region
+    epsilon = 0.25
+
+    # planning horizon
+    planning_horizon = 30
+
+    # defines discount_factor
+    discont_factor = 1.0
+
+    num_sucess = 0
+    num_fail = 0
+    num_planning = 125
+    num_particles = 100
+
+    if save_data:
+        save_dir = os.path.join('/home/share_folder/dataset', '4.11/1000/exec')
+        if not os.path.exists(save_dir):
+            os.mkdir(save_dir)
+            
+    if save_sim_data:
+        save_dir_sim = os.path.join('/home/share_folder/dataset', '4.11/1000/sim')
+        # save_dir_sim = os.path.join(os.getcwd(),'Learning/dataset', 'test')
+        if not os.path.exists(save_dir_sim):
+            os.mkdir(save_dir_sim)
+    else:
+        save_dir_sim = False
+
+    if exp:
+        log_dir = os.path.join(os.getcwd(), 'result/log')
+        if not os.path.exists(log_dir):
+            os.mkdir(log_dir)
+
+    log_time = []
+    log_total_reward = []
+    log_total_reward_success = []
+    log_total_reward_fail = []
+    log_sim_success_rate = []
+    log_val_root_success_traj_avg = []
+    log_val_action_success_traj_avg = []
+    log_val_root_fail_traj_avg = []
+    log_val_action_fail_traj_avg = []
+    log_val_root_step = []
+    log_val_action_step = []
+    # log_sim_success_rate_step1 = []
+
+    if guide_policy:
+        nn_config_policy = SettingPolicy()
+        policynet = NNRegressionPolicyModel(nn_config_policy)
+    else:
+        policynet = None
+
+    if guide_value == 'V':
+        nn_config_value = SettingValue()
+        valuenet = GuideValueNet(nn_config_value, guide_value_const)
+    elif guide_value == 'Q':
+        nn_config_value = SettingQValue()
+        valuenet = GuideQValueNet(nn_config_value)
+    else:
+        valuenet = None
+
+    for n in range(num_planning):
+        print("========================================================") 
+        print("========================= %d-th ========================" % (n+1)) 
+        print("========================================================")
+
+        if save_sim_data:
+            save_sim_name = f'{save_sim_data}_{n}'
+        else:
+            save_sim_name = False
+
+        if randomize:
+            # randomize initial & goal state
+            init_pos = np.random.rand(2) * 2
+            # init_pos[0] -= 1
+            init_pos[1] += 3
+            goal_pos = np.random.rand(2) - 0.5
+            goal_pos[0] -= 1.5
+        else:
+            # fixed inital & goal state
+            init_pos = (2.5, 2.5)
+            goal_pos = (0, 0)
+
+        init_state = State(tuple(init_pos))
+        goal_state = State(tuple(goal_pos))
+
+        # # inital belief state is uniformly distribution
+        # # init_belief = Histogram({})
+        # init_belief = []
+        # # # For uniform initialization
+        # # while len(init_belief) < num_particles:
+        # #     sample = State(tuple(2.5 + random_range * (np.random.rand(2)-0.5)))
+        # #     init_belief.append(sample)
+        #     # init_belief[sample] = 1 / (random_range**2 * num_particles)
+        # # For gaussian initalization
+        # # init_belief_std = 0.1
+        # # init_belief_std = 0.5
+        # init_belief_std = 1.0
+        # while len(init_belief) < num_particles:
+        #     # # uniform distribution
+        #     # radius = init_belief_std * np.random.rand(1)
+        #     # theta = 2 * np.pi * np.random.rand(1)
+        #     # noise = np.asarray([radius * np.cos(theta), radius * np.sin(theta)]).reshape(2)
+        #     # sample = State(tuple(init_state.position + noise))
+
+        #     # normal distribution
+        #     sample = State(tuple(np.asarray(init_state.position) + init_belief_std * (np.random.randn(2))))
+
+        #     init_belief.append(sample)
+
+        # init_belief = Particles(init_belief)
+               
+        # creates POMDP model
+        light_dark_problem = LightDarkProblem(init_state, None, goal_state, light, const, epsilon, policynet, valuenet)
+        # light_dark_problem.agent.set_belief(Particles.from_histogram(init_belief,num_particles=1))
+        
+        init_belief = []
+        while len(init_belief) < num_particles:
+            particle = State(light_dark_problem.agent.observation_model.sample(init_state, None).position)
+            init_belief.append(particle)
+        init_belief = Particles(init_belief)
+        light_dark_problem.agent.set_belief(init_belief, True)
+
+        # set planner
+        # planner = POMCPOW(pomdp=light_dark_problem, max_depth=planning_horizon, planning_time=-1., num_sims=num_particles,
+        #                 discount_factor=discont_factor, save_dir_sim=save_dir_sim, exploration_const=math.sqrt(2),
+        #                 num_visits_init=0, value_init=0)
+        planner = POMCPOW(pomdp=light_dark_problem, max_depth=planning_horizon, planning_time=-1., num_sims=num_particles,
+                        discount_factor=discont_factor, save_dir_sim=save_dir_sim, exploration_const=10,
+                        num_visits_init=0, value_init=0)
+        # planner = POMCPOW(pomdp=light_dark_problem, max_depth=planning_horizon, planning_time=-1., num_sims=num_particles,
+        #                 discount_factor=discont_factor, save_dir_sim=save_dir_sim, exploration_const=150,
+        #                 num_visits_init=0, value_init=0)
+
+        # Visualization setting
+        if plotting:
+            x_range = (-4, 6)
+            y_range = (-3, 7)
+            viz = LightDarkViz(light_dark_problem, x_range, y_range, 0.2)
+
+        # planning
+        print("==== Planning ====")
+        total_reward = 0
+        total_num_sims = 0
+        total_num_sims_success = 0
+        total_plan_time = 0.0
+        log_time_each = []
+        log_val_each_root = []
+        log_val_each_action = []
+        traj_data = []
+
+        for i in range(planning_horizon):
+            logging = save_log and i==0
+            if i == 0:
+                print("Goal state: %s" % goal_state)
+                print("Inital state: %s" % light_dark_problem.env.state)
+                print("Inital belief state expectation:", expectation_belief(light_dark_problem.agent.cur_belief))
+                # print("Inital belief state: %s" % str(light_dark_problem.agent.cur_belief))
+                print("Number of particles:", len(light_dark_problem.agent.cur_belief))
+
+                # initial history
+                init_observation = light_dark_problem.agent._observation_model.sample(light_dark_problem.env.state, (0,0))
+                light_dark_problem.agent.update_history((0,0), init_observation.position, light_dark_problem.env.state.position, 0)
+
+                if plotting:
+                    viz.log_state(light_dark_problem.env.state)
+                    viz.log_belief_expectation(expectation_belief(light_dark_problem.agent.cur_belief))
+
+            print("==== Step %d ====" % (i+1))
+
+            if save_sim_name:
+                save_sim_name_ = f'{save_sim_name}_{i}_1'
+            else:
+                save_sim_name_ = False
+            
+            if not(only_guide):
+                best_action, time_taken, sims_count, sims_count_success, root_value, action_value, step_data = planner.plan(light_dark_problem.agent, i, logging, save_sim_name_, randomize, guide_policy, rollout_guide, guide_value)
+            else:
+                best_action, time_taken = policynet.sample(light_dark_problem.agent.history, goal_state.position)
+                sims_count = 1
+                sims_count_success = 1
+                root_value = 0
+                action_value = 0
+                step_data = ()
+
+
+            traj_data.append(step_data)
+            log_time_each.append(time_taken)
+            log_val_each_root.append(root_value)
+            log_val_each_action.append(action_value)
+            log_time_each_avg = np.mean(np.asarray(log_time_each))
+            log_val_each_root_avg = np.mean(np.asarray(log_val_each_root))
+            log_val_each_action_avg = np.mean(np.asarray(log_val_each_action))
+
+            # |FIXME|
+            next_state = light_dark_problem.agent.transition_model.sample(light_dark_problem.env.state, best_action)
+            real_observation = light_dark_problem.agent.observation_model.sample(next_state, best_action)
+            
+            # select observataion node in existing node - unrealistic
+            # real_observation = random.choice(list(planner._agent.tree[best_action].children.keys()))
+            
+            total_num_sims += sims_count
+            total_num_sims_success += sims_count_success
+            total_plan_time += time_taken
+
+            if not(only_guide):
+                check_goal = planner.update(light_dark_problem.agent, light_dark_problem.env, best_action, next_state, real_observation)
+            else:
+                light_dark_problem.env.apply_transition(next_state)
+                check_goal = light_dark_problem.env.reward_model.is_goal_state(next_state)
+            # |TODO| can move before update to avoid confusion state case and belief case?
+            # By belief state
+            # reward = light_dark_problem.env.reward_model.sample(light_dark_problem.agent.cur_belief, best_action, light_dark_problem.agent.cur_belief)
+            # # By true state
+            # reward = light_dark_problem.env.reward_model.sample(next_state, best_action, next_state)
+
+            # |NOTE| only take positive reward as achieving goal condition
+            if not check_goal: # if you want to use reward proportional to the number of particles which is satisfied the goal condition, use reward_model.sample().
+                reward = -1.
+            else:
+                reward = 100.
+
+            total_reward = reward + discont_factor * total_reward
+
+            # |TODO| how to move in planner.update? need to resolve "TODO" for reward
+            # update history
+            light_dark_problem.agent.update_history(best_action, real_observation.position, next_state.position, reward)
+
+            print("Action: %s" % str(best_action))
+            print("Observation: %s" % real_observation)
+            print("Goal state: %s" % goal_state)
+            print("True state: %s" % light_dark_problem.env.state)
+            print("Belief state expectation:", expectation_belief(light_dark_problem.agent.cur_belief))
+            # print("Belief state: %s" % str(light_dark_problem.agent.cur_belief))
+            print("Number of particles:", len(light_dark_problem.agent.cur_belief))
+            print("Reward: %s" % str(reward))
+            print("Num sims: %d" % sims_count)
+            print("Num sims success: %d" % sims_count_success)
+            # if i == 0:
+            #     log_sim_success_rate_step1.append(sims_count_success/sims_count)
+            print("Plan time: %.5f" % time_taken)
+            
+            if plotting:
+                # viz.set_initial_belief_pos(b_0[0])
+                # viz.log_position(tuple(b_0[0]), path=0)
+                # viz.log_position(tuple(b_0[0]), path=1)
+                viz.log_state(light_dark_problem.env.state)
+                viz.log_belief(light_dark_problem.agent.cur_belief)
+                # viz.log_belief_expectation(expectation_belief(light_dark_problem.agent.cur_belief))
+
+            if check_goal:
+                print("\n")
+                print("==== Success ====")
+                print("Total reward: %.5f" % total_reward)
+                log_total_reward.append(total_reward)
+                log_total_reward_success.append(total_reward)
+                # print("History:", planner.history)
+                print("Total Num sims: %d" % total_num_sims)
+                print(f"Num sims success: {total_num_sims_success} ({100 * total_num_sims_success/total_num_sims}%)")
+                print("Total Plan time: %.5f" % total_plan_time)
+                num_sucess += 1
+         
+                log_val_root_success_traj_avg.append(log_val_each_root_avg)
+                log_val_action_success_traj_avg.append(log_val_each_action_avg)
+                log_val_root_step.append(log_val_each_root)
+                log_val_action_step.append(log_val_each_action)
+                
+                # # save data
+                # if save_data:
+                #     with open(os.path.join(save_dir,'success_history.pickle'), 'ab') as f:
+                #         pickle.dump(planner.history[:-1], f, pickle.HIGHEST_PROTOCOL)
+                #     with open(os.path.join(save_dir,'success_value.pickle'), 'ab') as f:
+                #         pickle.dump(total_reward, f, pickle.HIGHEST_PROTOCOL)
+                
+                # # Saving success simulation history
+                # if save_sim_data:
+                #     if planner.history_data is None:
+                #         pass
+                #     else:
+                #         sim_data = planner.history_data
+                #         sim_data.append(goal_pos)
+                #         sim_data.append(total_reward)
+                #         with open(os.path.join(save_dir_sim, 'simulation_history_data.pickle'), 'ab') as f:
+                #             pickle.dump(sim_data, f)
+                        
+                if save_data:
+                    traj_data.append(goal_pos)
+                    traj_data.append(total_reward)
+                    with open(os.path.join(save_dir, 'success', f'{name_dataset}_{n}.pickle'), 'wb') as f:
+                        pickle.dump(traj_data, f)
+                        
+                # if plotting is not None and len(viz._log_state)<=5:
+                if plotting:
+                    viz.plot(path_colors={0: [(0,0,0), (0,255,0)],
+                                            1: [(0,0,0), (255,0,0)]},
+                                path_styles={0: "--",
+                                            1: "-"},
+                                path_widths={0: 4,
+                                            1: 1})
+                    # plt.show()
+                    plt.savefig(f'{plotting}.png')
+                
+                break
+
+            elif i == planning_horizon-1:
+                print("==== Fail ====")
+                print("Total reward: %.5f" % total_reward)
+                log_total_reward.append(total_reward)
+                log_total_reward_fail.append(total_reward)
+                # print("History:", planner.history)
+                print("Total Num sims: %d" % total_num_sims)
+                print(f"Num sims success: {total_num_sims_success} ({100 * total_num_sims_success/total_num_sims}%)")
+                print("Total Plan time: %.5f" % total_plan_time)
+                num_fail += 1
+
+                log_val_root_fail_traj_avg.append(log_val_each_root_avg)
+                log_val_action_fail_traj_avg.append(log_val_each_action_avg)
+                log_val_root_step.append(log_val_each_root)
+                log_val_action_step.append(log_val_each_action)
+
+                # # save data
+                # if save_data:
+                #     with open(os.path.join(save_dir,'fail_history.pickle'), 'ab') as f:
+                #         pickle.dump(planner.history[:-1], f, pickle.HIGHEST_PROTOCOL)
+                #     with open(os.path.join(save_dir,'fail_value.pickle'), 'ab') as f:
+                #         pickle.dump(total_reward, f, pickle.HIGHEST_PROTOCOL)
+
+                # # Saving fail history
+                # if save_sim_data:
+                #     if planner.history_data is None:
+                #         pass
+                #     else:
+                #         sim_data = planner.history_data
+                #         sim_data.append(goal_pos)
+                #         sim_data.append(total_reward)
+                #         with open(os.path.join(save_dir_sim, 'simulation_history_data.pickle'), 'ab') as f:
+                #             pickle.dump(sim_data, f)
+                        
+                if save_data:
+                    traj_data.append(goal_pos)
+                    traj_data.append(total_reward)
+                    with open(os.path.join(save_dir, 'fail', f'{name_dataset}_{n}.pickle'), 'wb') as f:
+                        pickle.dump(traj_data, f)
+                
+                # if plotting is not None and len(viz._log_state)<=5:
+                if plotting:
+                    viz.plot(path_colors={0: [(0,0,0), (0,255,0)],
+                                            1: [(0,0,0), (255,0,0)]},
+                                path_styles={0: "--",
+                                            1: "-"},
+                                path_widths={0: 4,
+                                            1: 1})
+                    # plt.show()
+                    plt.savefig(f'{plotting}.png')
+                        
+
+        log_time.append(log_time_each_avg)
+        log_sim_success_rate.append(total_num_sims_success/total_num_sims)
+
+        print("num_sucess: %d" % num_sucess)
+        print("num_fail: %d" % num_fail)
+
+    sims_success_rate = np.mean(np.asarray(log_sim_success_rate))
+    time_mean = np.mean(np.asarray(log_time))
+    time_std = np.std(np.asarray(log_time))
+    total_reward_mean = np.mean(np.asarray(log_total_reward))
+    total_reward_std = np.std(np.asarray(log_total_reward))
+    total_reward_success_mean = np.mean(np.asarray(log_total_reward_success))
+    total_reward_success_std = np.std(np.asarray(log_total_reward_success))
+    total_reward_fail_mean = np.mean(np.asarray(log_total_reward_fail))
+    total_reward_fail_std = np.std(np.asarray(log_total_reward_fail))
+    root_val_total = log_val_root_success_traj_avg + log_val_root_fail_traj_avg
+    action_val_total = log_val_action_success_traj_avg + log_val_action_fail_traj_avg
+    root_val_total_mean = np.mean(np.asarray(root_val_total))
+    action_val_total_mean = np.mean(np.asarray(action_val_total))
+    root_val_total_std = np.std(np.asarray(root_val_total))
+    action_val_total_std = np.std(np.asarray(action_val_total))
+    root_val_success_mean = np.mean(np.asarray(log_val_root_success_traj_avg))
+    action_val_success_mean = np.mean(np.asarray(log_val_action_success_traj_avg))
+    root_val_success_std = np.std(np.asarray(log_val_root_success_traj_avg))
+    action_val_success_std = np.std(np.asarray(log_val_action_success_traj_avg))
+    root_val_fail_mean = np.mean(np.asarray(log_val_root_fail_traj_avg))
+    action_val_fail_mean = np.mean(np.asarray(log_val_action_fail_traj_avg))
+    root_val_fail_std = np.std(np.asarray(log_val_root_fail_traj_avg))
+    action_val_fail_std = np.std(np.asarray(log_val_action_fail_traj_avg))
+
+    # val_step_1_2 = []
+    # for v in log_val_step:
+    #     val_step_1_2.append(v[0:2])
+    # val_step_1_2_mean = np.mean(np.asarray(val_step_1_2).reshape(-1, 2), axis=0)
+    # val_step_1_2_std = np.std(np.asarray(val_step_1_2).reshape(-1, 2), axis=0)
+    # sims_success_rate_step1 = np.mean(np.asarray(log_sim_success_rate_step1))
+
+    print("====Finish===")
+    print("total_num_sucess: %d" % num_sucess)
+    print("total_num_fail: %d" % num_fail)
+    print(f"sims success rate: {sims_success_rate * 100}%")
+    print("planning time(mean): %f" % time_mean)
+    print("planning time(std): %f" % time_std)
+    print("total reward(mean): %f" % total_reward_mean)
+    print("total reward(std): %f" % total_reward_std)
+    print("total reward(success/mean): %f" % total_reward_success_mean)
+    print("total reward(success/std): %f" % total_reward_success_std)
+    print("total reward(fail/mean): %f" % total_reward_fail_mean)
+    print("total reward(fail/std): %f" % total_reward_fail_std)
+    print("value of tree(total/mean): %f" % root_val_total_mean)
+    print("value of tree(total/std): %f" % root_val_total_std)
+    print("value of tree(success/mean): %f" % root_val_success_mean)
+    print("value of tree(success/std): %f" % root_val_success_std)
+    print("value of tree(fail/mean): %f" % root_val_fail_mean)
+    print("value of tree(fail/std): %f" % root_val_fail_std)
+    print("value of action(total/mean): %f" % action_val_total_mean)
+    print("value of action(total/std): %f" % action_val_total_std)
+    print("value of action(success/mean): %f" % action_val_success_mean)
+    print("value of action(success/std): %f" % action_val_success_std)
+    print("value of action(fail/mean): %f" % action_val_fail_mean)
+    print("value of action(fail/std): %f" % action_val_fail_std)
+    # print("value of tree(mean@step 1,2):", val_step_1_2_mean)
+    # print("value of tree(std@step 1,2):", val_step_1_2_std)
+    # print(f"sims success rate(@step 1): {sims_success_rate_step1 * 100}%")
+    
+    if exp:
+        with open(os.path.join(log_dir, f'{exp}.txt'), 'w') as f:
+            f.write("total_num_sucess: %d\n" % num_sucess)
+            f.write("total_num_fail: %d\n" % num_fail)
+            f.write(f"sims success rate: {sims_success_rate * 100}%\n")
+            f.write("planning time(mean): %f\n" % time_mean)
+            f.write("planning time(std): %f\n" % time_std)
+            f.write("total reward(mean): %f" % total_reward_mean)
+            f.write("total reward(std): %f" % total_reward_std)
+            f.write("total reward(success/mean): %f" % total_reward_success_mean)
+            f.write("total reward(success/std): %f" % total_reward_success_std)
+            f.write("total reward(fail/mean): %f" % total_reward_fail_mean)
+            f.write("total reward(fail/std): %f" % total_reward_fail_std)
+            f.write("value of tree(total/mean): %f\n" % root_val_total_mean)
+            f.write("value of tree(total/std): %f\n" % root_val_total_std)
+            f.write("value of tree(success/mean): %f\n" % root_val_success_mean)
+            f.write("value of tree(success/std): %f\n" % root_val_success_std)
+            f.write("value of tree(fail/mean): %f\n" % root_val_fail_mean)
+            f.write("value of tree(fail/std): %f\n" % root_val_fail_std)
+            f.write("value of action(total/mean): %f\n" % action_val_total_mean)
+            f.write("value of action(total/std): %f\n" % action_val_total_std)
+            f.write("value of action(success/mean): %f\n" % action_val_success_mean)
+            f.write("value of action(success/std): %f\n" % action_val_success_std)
+            f.write("value of action(fail/mean): %f\n" % action_val_fail_mean)
+            f.write("value of action(fail/std): %f\n" % action_val_fail_std)
+
+if __name__ == '__main__':
+    main()

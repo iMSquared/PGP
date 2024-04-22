@@ -1,0 +1,159 @@
+project_params:
+  use_nvidia: False
+  custom_urdf_path: "urdf"
+  robot: "ur5_suction"
+
+  processing:
+    request_timeout: 60.0    # Seconds
+
+  debug:
+    show_gui: True
+    get_data: False
+
+
+sim_params:
+  control_hz: 240.0 
+  delay: 0.0
+  gravity: -9.81
+
+  debug_camera:
+    distance: 1.0
+    yaw: 150
+    pitch: -40
+    target_position: [0.4, -0.05, 0.15]
+
+manipulation_params:
+  inverse_kinematics:
+    max_num_iterations: 1000
+    residual_threshold: 1.0E-8  
+  rrt_trials: 100
+
+pose_sampler_params:
+  num_filter_trials: 1000
+  grasp_affordance_threshold: 0.67
+
+
+env_params:
+  binpick_env:
+
+    cabinet:
+      path: "cabinet/cabinet.urdf"
+      pos: [0.65, 0.0, 0.0]
+      orn: [0.0, 0.0, 0.0]
+
+    objects:
+      num_objects: 2
+      path: [
+        "YcbPear/model.urdf",
+        "YcbCrackerBox/model.urdf",
+      ]
+      pos: [
+        [0.55, -0.05, 0.54],  # TODO: Bug here...
+        [0.7, 0.05, 0.54],
+      ]
+      orn: [
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0],
+      ]
+      scale: [1.0, 1.0]
+      target: "YcbCrackerBox/model.urdf"
+
+
+    depth_camera:
+      target_pos: [0.7, 0.0, 0.6]
+      distance: 0.6
+      roll: 0.0
+      pitch: 0.0
+      yaw: -90.0
+
+      fov: 60.0
+      width: 64
+      height: 64
+      near_val: 0.1
+      far_val: 0.7
+      voxel_down_sample_size: 0.01
+      
+      noise_std: 0.002
+      
+
+robot_params:
+
+  ur5:
+    path: "ur5/urdf/ur5_rg2.urdf"
+    pos: [0.0, 0.0, 0.3]
+    orn: [0.0, 0.0, 0.0]
+
+    joint_index_last: 13
+    joint_indices_arm: [1, 2, 3, 4, 5, 6] # Without base fixed joint (UR5 specific)
+    link_index_endeffector_base: 7        # Base link starts from -1
+
+    rest_pose: [
+      0.0,        # Base (Fixed)  # Fixed joints are ignored from IK.
+      0.0,        # Joint 1
+      -2.094,     # Joint 2
+      2.07,       # Joint 3
+      -2.618,     # Joint 4
+      -1.57,      # Joint 5
+      0.0,        # Joint 6
+      0.0,        # EE Base (Fixed)
+      0.0,        # Finger 8 (Mimic)
+      0.0,        # Finger 9 (Mimic)
+      0.0,        # Finger 10 (Mimic)
+      0.8,        # Finger 11
+      0.0,        # Finger 12 (Mimic)
+      0.0,        # Finger 13 (Mimic)
+    ]
+
+
+    # Below here is robot dependent
+    gripper: 
+      joint_index_finger: 11
+      joint_value_finger_open: 0.8
+      distance_finger_to_endeffector_base: 0.199
+
+      joint_indices_finger_mimic: [8, 9, 10, 12, 13]
+      joint_gear_ratio_mimic: [1., 1., -1., -1., 1.]  # Negative value of mimic multiplier in URDF.
+
+  ur5_suction:
+    path: "ur5/urdf/ur5_suction.urdf"
+    pos: [0.0, 0.0, 0.3]
+    orn: [0.0, 0.0, 0.0]
+
+    joint_index_last: 6
+    joint_indices_arm: [1, 2, 3, 4, 5, 6]   # Without base fixed joint (UR5 specific)
+    link_index_endeffector_base: 6          # 6 is more stable than 7 when solving IK... for some unknown reason       
+
+    rest_pose: [
+      0.0,        # Base (Fixed)  
+      0.0,        # Joint 1
+      -2.094,     # Joint 2
+      2.07,       # Joint 3
+      0.524,     # Joint 4
+      1.57,      # Joint 5
+      0.0,        # Joint 6         (Try to reset to 0 after release)
+      0.0,        # Joint 7 EE Base (Fixed)
+    ]
+
+    gripper:
+      link_index_endeffector_tip: 10
+      
+      base_to_tip_stroke: 0.12      # 12 cm from wrist3 link frame (link 6)
+
+      grasp_poke_backward: 0.05     # Start poking from 10cm backward 
+      grasp_poke_criteria: 0.003    # 3mm poke?
+
+
+
+plan_params:
+  num_sims: 100
+  max_depth: 4
+  planning_time: -1
+  discount_factor: 1.0
+  exploration_const: 5
+  k_a: 2
+  alpha_a: 0.5
+  k_o: 2
+  alpha_o: 0.5
+  select_best_action: True
+  evaluate_node: "rollout"
+  simulator: "pybullet"

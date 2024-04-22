@@ -1,0 +1,111 @@
+
+project_params:
+  use_nvidia: False
+  custom_urdf_path: "urdf"
+  robot: "ur5"
+  debug:
+    show_gui: False
+    get_data: False
+    save_result: True
+  num_test: 100
+
+
+sim_params:
+  control_hz: 240.0 
+  delay: 0.0
+  gravity: -9.81
+
+  debug_camera:
+    distance: 0.5
+    yaw: -240
+    pitch: -20
+    target_position: [1.0, 0.40, 0.6]
+
+
+manipulation_params:
+  inverse_kinematics:
+    max_num_iterations: 1000
+    residual_threshold: 1.0E-8
+  rrt_trials: 100
+
+
+pose_sampler_params:
+  num_filter_trials: 200
+  grasp_affordance_threshold: 0.9
+
+
+env_params:
+  grasp_test_env:
+
+    objects:
+      pos: [0.5, 0.0, 0.54]
+      orn: [0.0, 0.0, 0.0]
+
+
+robot_params:
+
+  ur5:
+    path: "ur5/urdf/ur5_rg2.urdf"
+    pos: [0.0, 0.0, 0.3]
+    orn: [0.0, 0.0, 0.0]
+
+    joint_index_last: 13
+    joint_indices_arm: [1, 2, 3, 4, 5, 6] # Without base fixed joint (UR5 specific)
+    link_index_endeffector_base: 7        # Base link starts from -1
+    joint_index_finger: 11
+    joint_value_finger_open: 0.8
+
+    distance_finger_to_endeffector_base: 0.199
+
+    rest_pose: [
+      0.0,        # Base (Fixed)
+      0.0,        # Joint 1
+      -2.094,     # Joint 2
+      2.07,       # Joint 3
+      -2.618,     # Joint 4
+      -1.57,      # Joint 5
+      0.0,        # Joint 6
+      0.0,        # EE Base (Fixed)
+      0.0,        # Finger 8 (Mimic)
+      0.0,        # Finger 9 (Mimic)
+      0.0,        # Finger 10 (Mimic)
+      0.8,        # Finger 11
+      0.0,        # Finger 12 (Mimic)
+      0.0,        # Finger 13 (Mimic)
+    ]
+
+    # Below here is robot dependent
+    joint_indices_finger_mimic: [8, 9, 10, 12, 13]
+    joint_gear_ratio_mimic: [1., 1., -1., -1., 1.]  # Negative value of mimic multiplier in URDF.
+
+
+
+  franka_panda:
+    path: "franka_panda/panda.urdf"
+    pos: [0.0, 0.0, 0.0]
+    orn: [0.0, 0.0, 0.0]
+
+    joint_index_last: 10
+    joint_indices_arm: [0, 1, 2, 3, 4, 5, 6]
+    link_index_endeffector_base: 8      # Base link starts from -1
+    joint_index_finger: 9
+    joint_value_finger_open: 0.08
+
+    distance_finger_to_endeffector_base: 0.10
+
+    rest_pose: [
+      0.0,        # Joint 0
+      -0.6,       # Joint 1
+      0.0,        # Joint 2
+      -2.57,      # Joint 3
+      0.0,        # Joint 4
+      3.5,        # Joint 5
+      0.75,       # Joint 6
+      0.0,        # Joint 7
+      0.0,        # EE Base (Fixed)
+      0.08,       # EE Right finger
+      0.08        # EE Left finger
+    ]
+
+    # Below is Robot dependent
+    joint_indices_fingers: [9, 10]
